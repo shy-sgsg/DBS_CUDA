@@ -99,7 +99,7 @@ endif()
 find_package(Threads REQUIRED)
 
 # ===== CUDA 和 cuFFT =====
-find_package(CUDA REQUIRED)
+# find_package(CUDA REQUIRED)
 find_package(CUDAToolkit REQUIRED)
 message(STATUS "CUDA Toolkit found: ${CUDAToolkit_VERSION}")
 message(STATUS "cuFFT library: ${CUDA_cufft_LIBRARY}")
@@ -117,6 +117,7 @@ set(SRC
   src/processAllBeams.cpp
   src/lodepng.cpp  # PNG写出
   src/RangeCompressCuFFT.cu  # cuFFT 距离脉压
+  src/stitcher_kernel.cu  # GPU 全流程拼接 kernel
   # ... 其余源文件
 )
 

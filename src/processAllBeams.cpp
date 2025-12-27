@@ -3,6 +3,7 @@
 #include "RangeCompressCuFFT.hpp"
 #include <fstream>
 #include <iostream>
+#include <chrono>
 #include <numeric>
 #include <cmath>
 #include <stdexcept>
@@ -121,11 +122,25 @@ bool DbsStitcher::processAllBeams(Params &P,
     if (!P.isPC)
     {
       std::vector<std::complex<double>> HfSpec = buildHfSpecFromParams(P);
+
+      // --- 计时开始 ---
+      auto start_time = std::chrono::high_resolution_clock::now();
+
       if (!rangeCompressCuFFT(P, raw, HfSpec, rc))
       {
         std::fprintf(stderr, "[ERR] rangeCompressCuFFT failed on beam %d\n", b);
         return false;
       }
+
+      // --- 计时结束 ---
+      auto end_time = std::chrono::high_resolution_clock::now();
+
+      // 计算持续时间 (单位：毫秒)
+      std::chrono::duration<double, std::milli> duration = end_time - start_time;
+      
+      // 打印结果
+      // std::cout << "[TIMER] Beam " << b << " rangeCompressCuFFT took: "
+      //           << duration.count() << " ms" << std::endl;
     }
     else
     {

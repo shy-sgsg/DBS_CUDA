@@ -48,6 +48,11 @@ public:
   bool buildMosaic(const Params &P, const RDData &RD, const MetaPack &meta,
                    const Grid &grid, Mosaic &mosaic);
 
+  // GPU-accelerated version of buildMosaic. Preserves the original API but
+  // performs batched bilinear interpolation and other hot paths on the GPU.
+  bool buildMosaicGPU(const Params &P, const RDData &RD, const MetaPack &meta,
+                      const Grid &grid, Mosaic &mosaic);
+
   bool writeProducts(const Params &P, const Grid &grid, const Mosaic &mosaic, const Bounds &b);
 
   int estimateEffectiveAzBins(const Params &P, const PosData &POS);

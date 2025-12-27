@@ -12,7 +12,6 @@ doc/
 __MACOSX/
 **/._*
 
-
 # CMake相关文件
 CMakeCache.txt
 CMakeFiles/
