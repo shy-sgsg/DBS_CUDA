@@ -13,6 +13,7 @@ struct BeamDevParams {
   float min_fd;
   float delta_fd;
   uint64_t offset; // offset in floats into d_all_amps
+  int flag;        // flight dir flag (matches CPU infer_flight_dir_flag + squint_side*4)
 };
 
 // 定义一个普通的 C++ 函数作为包装器

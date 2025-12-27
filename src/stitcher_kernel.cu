@@ -27,19 +27,61 @@ __global__ void buildMosaicFullKernel(
     for (int b = 0; b < B; ++b) {
         BeamDevParams bp = d_beams[b];
 
-        // relative coords and simplified rotation (as discussed)
+        // relative coords
         float dx = x_label - bp.x;
         float dy = y_label - bp.y;
+
+        // rotation using the same "rotation_xy_inv" convention from CPU
         float c = bp.cos_j;
         float s = bp.sin_j;
-        float x_tmp = dx * c + dy * s;
-        float y_tmp = -dx * s + dy * c;
+        int flag = bp.flag; // per-beam flag (matches CPU)
+
+        float x_tmp = 0.0f, y_tmp = 0.0f;
+        switch (flag)
+        {
+        case 1:
+            x_tmp = -dx * c - dy * s;
+            y_tmp = -dx * s + dy * c;
+            break;
+        case 2:
+            x_tmp = dx * c + dy * s;
+            y_tmp = dx * s - dy * c;
+            break;
+        case 3:
+            x_tmp = -dx * c + dy * s;
+            y_tmp = dx * s + dy * c;
+            break;
+        case 4:
+            x_tmp = dx * c - dy * s;
+            y_tmp = -dx * s - dy * c;
+            break;
+        case 6:
+            x_tmp = dx * c + dy * s;
+            y_tmp = -dx * s + dy * c;
+            break;
+        case 5:
+            x_tmp = -dx * c - dy * s;
+            y_tmp = dx * s - dy * c;
+            break;
+        case 8:
+            x_tmp = dx * c - dy * s;
+            y_tmp = dx * s + dy * c;
+            break;
+        case 7:
+            x_tmp = -dx * c + dy * s;
+            y_tmp = -dx * s - dy * c;
+            break;
+        default:
+            x_tmp = dx;
+            y_tmp = dy;
+            break;
+        }
 
         float R = sqrtf(x_tmp * x_tmp + y_tmp * y_tmp + Height * Height);
         float fd = (R > 1e-6f) ? (2.0f * bp.V_feiji * x_tmp / (R * lambda)) : 0.0f;
 
         float R_idx = (R - R_min) / R_bin;
-        float fd_idx = (fd - bp.min_fd) / bp.delta_fd;
+        float fd_idx = (fd - bp.min_fd) / (bp.delta_fd > 1e-9f ? bp.delta_fd : 1e-9f);
 
         if (R_idx >= 0.0f && R_idx < (float)(M - 1) && fd_idx >= 0.0f && fd_idx < (float)(nEff - 1)) {
             int r0 = (int)R_idx;

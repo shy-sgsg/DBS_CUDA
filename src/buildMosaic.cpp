@@ -344,9 +344,11 @@ bool DbsStitcher::buildMosaicGPU(const Params &P,
     bp.V_feiji = V;
     bp.sin_j = std::sin(angle);
     bp.cos_j = std::cos(angle);
-    bp.min_fd = RD.fd_axis[b].empty() ? 0.0f : RD.fd_axis[b].front();
-    bp.delta_fd = (nEff > 1) ? (RD.fd_axis[b].back() - RD.fd_axis[b].front()) / (float)(nEff - 1) : 1e-9f;
+    // Use the min/max-based fd definitions computed above (matches CPU logic)
+    bp.min_fd = min_RD_y[b];
+    bp.delta_fd = delta_RD_y[b];
     bp.offset = (uint64_t)h_all_amps.size();
+    bp.flag = flag; // use the same inferred flag as CPU (including squint_side)
 
     h_beams[b] = bp;
 
