@@ -112,6 +112,7 @@ set(SRC
   src/DbsIO.cpp
   src/buildMosaic.cpp
   src/azFftShiftAndRecenterMat.cpp
+  src/AzFftCuFFT.cu
   src/mapPosToBeam.cpp
   src/loadXML.cpp
   src/processAllBeams.cpp

@@ -60,7 +60,7 @@ static int main_dbs_stitch(const std::string& xmlPath) {
     RDData RD;
     RD.nEff = nEff;
     MetaPack meta;
-    if (!app.processAllBeams(P, POS, RD, meta)) {
+    if (!app.processAllBeamsGPU(P, POS, RD, meta)) {
         std::cerr << "[ERR] processAllBeams failed\n";
         return 4;
     }
@@ -86,7 +86,7 @@ static int main_dbs_stitch(const std::string& xmlPath) {
     // 6) GPU 拼接 (重点监控)
     step_timer.start();
     Mosaic mosaic;
-    if (!app.buildMosaic(P, RD, meta, grid, mosaic)) {
+    if (!app.buildMosaicGPU(P, RD, meta, grid, mosaic)) {
         std::cerr << "[ERR] buildMosaic failed\n";
         return 6;
     }

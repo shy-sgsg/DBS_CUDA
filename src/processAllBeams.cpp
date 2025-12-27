@@ -8,6 +8,7 @@
 #include <cmath>
 #include <stdexcept>
 #include "unwrap_fd.hpp"
+#include "AzFftCuFFT.hpp"
 
 // 光速（避免依赖外部 c0()）
 static inline float c0f_local() { return 299792458.0f; }
@@ -126,7 +127,7 @@ bool DbsStitcher::processAllBeams(Params &P,
       // --- 计时开始 ---
       auto start_time = std::chrono::high_resolution_clock::now();
 
-      if (!rangeCompressCuFFT(P, raw, HfSpec, rc))
+      if (!rangeCompressFFT(P, raw, HfSpec, rc))
       {
         std::fprintf(stderr, "[ERR] rangeCompressCuFFT failed on beam %d\n", b);
         return false;
@@ -249,6 +250,180 @@ bool DbsStitcher::processAllBeams(Params &P,
     RD.amp[b] = amp_eff;         // nEff x M
     RD.fd_axis[b] = fd_axis_eff; // 1 x nEff
     RD.rg_axis[b] = rg_axis_row; // 1 x M
+    meta.beams[b] = m;
+  }
+
+  return true;
+}
+
+// GPU-optimized version of processAllBeams. This function preserves the
+// original behavior but reorganizes some steps to reduce redundant work and
+// to call GPU-accelerated helpers where available (e.g. `rangeCompressCuFFT`).
+// It intentionally keeps error handling and output layout identical to the
+// CPU version so that the rest of the pipeline can remain unchanged.
+bool DbsStitcher::processAllBeamsGPU(Params &P,
+                                     const PosData &POS,
+                                     RDData &RD,
+                                     MetaPack &meta)
+{
+  const int B = P.beams_per_period;
+  const int N = P.beam_skip;
+  const int W = P.pulses_per_beam;
+  const int M = P.range_samp_used;
+
+  const int B_count = (int)std::ceil(B / std::max(1, N));
+
+  // Work on a local copy of Params so we don't permanently mutate caller's
+  // values while still applying the same sampling-rate adjustment used by the
+  // CPU path.
+  Params P2 = P;
+  P2.fs_hz = P.fs_hz * (static_cast<double>(M) / static_cast<double>(P.range_samp_total));
+
+  // ---- 预分配 ----
+  RD.nEff = (RD.nEff > 0) ? RD.nEff : estimateEffectiveAzBins(P2, POS);
+  RD.amp.resize(B_count);
+  RD.fd_axis.resize(B_count);
+  RD.rg_axis.resize(B_count);
+  meta.beams.resize(B_count);
+
+  // ---- 斜距轴（每波位相同，直接预生成一个 row 复用）----
+  const float Rbin = c0f_local() / (2.0f * static_cast<float>(P2.fs_hz));
+  std::vector<float> rg_axis_row(M);
+  for (int m = 0; m < M; ++m)
+    rg_axis_row[m] = static_cast<float>(P.Rmin_m) + m * Rbin;
+
+  // Precompute HfSpec once when performing GPU range compression to avoid
+  // rebuilding the same spec for every beam. This uses the adjusted sampling
+  // rate in P2.
+  std::vector<std::complex<double>> HfSpecGlobal;
+  if (!P2.isPC)
+    HfSpecGlobal = buildHfSpecFromParams(P2);
+
+  // ===== 主循环：逐波位处理 =====
+  for (int b = 0; b < B_count; ++b)
+  {
+    // (a) 读单波位 & 距离脉压（GPU：rangeCompressCuFFT）
+    BeamRaw<double> raw;
+    int p = b * std::max(1, N) + 1;
+    if (!readBeamRaw(P, p, raw))
+    {
+      std::fprintf(stderr, "[ERR] readBeamRaw failed on beam %d\n", b);
+      return false;
+    }
+
+    std::vector<std::complex<double>> rc; // W*M，行主（每行一脉冲）
+    if (!P2.isPC)
+    {
+      // Use GPU-based range compression. The implementation of
+      // rangeCompressCuFFT is expected to perform FFTs on the device and
+      // return the range-compressed rows into `rc` on the host.
+      auto start_time = std::chrono::high_resolution_clock::now();
+      if (!rangeCompressCuFFT(P2, raw, HfSpecGlobal, rc))
+      {
+        std::fprintf(stderr, "[ERR] rangeCompressCuFFT failed on beam %d\n", b);
+        return false;
+      }
+      auto end_time = std::chrono::high_resolution_clock::now();
+      std::chrono::duration<double, std::milli> duration = end_time - start_time;
+      DBG("Beam " << b << " rangeCompressCuFFT took: " << duration.count() << " ms");
+    }
+    else
+    {
+      const int Lraw = raw.Lraw;
+      const int Lraw2M = Lraw / M;
+      rc.resize((size_t)W * M);
+      for (int k = 0; k < W; ++k)
+      {
+        for (int m = 0; m < M; ++m)
+        {
+          rc[(size_t)k * M + m] = raw.s[(size_t)k * Lraw + m * Lraw2M];
+        }
+      }
+    }
+
+    // 调整 UTC 时间（与 CPU 路径一致）
+    double mean_utc = 0.0;
+    for (size_t i = 0; i < raw.t_utc.size(); ++i)
+      mean_utc += raw.t_utc[i];
+    mean_utc /= static_cast<double>(raw.t_utc.size());
+    for (size_t i = 0; i < raw.t_utc.size(); ++i)
+      if (mean_utc - raw.t_utc[i] > 0.8)
+        raw.t_utc[i] += 1;
+
+    // (b) POS 映射到脉冲时间
+    MapPosResult mpos;
+    if (!mapPosToBeam(raw.t_utc, POS, mpos))
+    {
+      std::fprintf(stderr, "[WARN] mapPosToBeam failed; fallback to global means\n");
+      std::vector<double> empty;
+      mapPosToBeam(empty, POS, mpos);
+    }
+
+    // meta 初始化
+    MetaPerBeam m;
+    m.vN = mpos.vN;
+    m.vE = mpos.vE;
+    m.vU = mpos.vU;
+    m.x = mpos.xyz0[0];
+    m.y = mpos.xyz0[1];
+    m.z = mpos.xyz0[2];
+    if (!raw.fw_angle_deg.empty())
+    {
+      float sum = std::accumulate(raw.fw_angle_deg.begin(), raw.fw_angle_deg.end(), 0.0f);
+      m.angle_deg = sum / static_cast<float>(raw.fw_angle_deg.size());
+    }
+    else
+    {
+      m.angle_deg = 0.0f;
+    }
+
+    // (c) f_d 估计与模糊修正（保持原算法）
+    const double speed = std::sqrt(m.vN * m.vN + m.vE * m.vE + m.vU * m.vU);
+    const double lambda = c0f_local() / static_cast<double>(P2.fc_hz);
+    std::vector<double> fd_ctr = estimateFdCenter(rc,
+                                P2.pulses_per_beam,
+                                P2.range_samp_used,
+                                P2.PRF,
+                                speed,
+                                raw.fw_angle_deg,
+                                lambda,
+                                1 /*method*/);
+    m.fd_ctr = fd_ctr[1];
+    meta.beams[b].fd_ctr = m.fd_ctr;
+    DBG("Beam " << b << " estimated fd_ctr=" << m.fd_ctr << " Hz");
+
+    // (d) 方位 FFT + 频率重心移零
+    Image2D<std::complex<float>> rcImg(W, M);
+    if (static_cast<int>(rc.size()) != W * M)
+    {
+      std::fprintf(stderr, "[ERR] rc size mismatch on beam %d\n", b);
+      return false;
+    }
+    for (int r = 0; r < W; ++r)
+      for (int c = 0; c < M; ++c)
+        rcImg.at(r, c) = static_cast<std::complex<float>>(rc[static_cast<size_t>(r) * M + c]);
+
+    Image2D<std::complex<float>> azSpec;
+    if (!azFftShiftAndRecenterCuFFT(rcImg, static_cast<float>(P2.PRF), m.fd_ctr, azSpec))
+    {
+      std::fprintf(stderr, "[ERR] azFftShiftAndRecenterCuFFT failed on beam %d\n", b);
+      return false;
+    }
+
+    // (f) 裁剪有效方位通道
+    Image2D<float> amp_eff;
+    std::vector<float> fd_axis_eff;
+    if (!sliceEffectiveAzBins(azSpec, 0.0f, RD.nEff, static_cast<float>(P2.PRF),
+                              amp_eff, fd_axis_eff))
+    {
+      std::fprintf(stderr, "[ERR] sliceEffectiveAzBins failed on beam %d\n", b);
+      return false;
+    }
+
+    // 写回 RD / meta
+    RD.amp[b] = amp_eff;
+    RD.fd_axis[b] = fd_axis_eff;
+    RD.rg_axis[b] = rg_axis_row;
     meta.beams[b] = m;
   }
 

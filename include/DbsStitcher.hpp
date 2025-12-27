@@ -40,6 +40,13 @@ public:
   bool loadPosAndEstimateVelocity(const Params &P, PosData &POS);
   bool processAllBeams(Params &P, const PosData &POS, RDData &RD, MetaPack &meta);
 
+  // GPU-accelerated end-to-end beam processing. Preserves the original
+  // API but reorganizes the workflow to leverage existing GPU helpers
+  // (e.g. `rangeCompressCuFFT`) and reduce redundant host work.
+  // This function keeps the original `processAllBeams` intact so callers
+  // can choose CPU or GPU processing explicitly.
+  bool processAllBeamsGPU(Params &P, const PosData &POS, RDData &RD, MetaPack &meta);
+
   bool updateFdCtrEstimates(Params &P, RDData &RD, MetaPack &meta, const std::string &xmlPath);
 
   bool estimateMosaicExtent(const Params &P, const RDData &RD, const MetaPack &meta,
