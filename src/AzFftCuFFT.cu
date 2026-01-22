@@ -36,6 +36,74 @@ __global__ static void circshift_rows_kernel(cufftComplex *d_in, cufftComplex *d
   d_out[dst_idx] = d_in[src_idx];
 }
 
+// Device-oriented wrapper: operate on device buffers directly.
+bool azFftShiftAndRecenterCuFFT_device(void *d_rcFloat_void,
+                                       int W, int M,
+                                       float PRF, float fd_ctr,
+                                       void *d_azOut_void,
+                                       void *stream_void)
+{
+  if (W <= 0 || M <= 0) return false;
+  cufftComplex *d_buf = reinterpret_cast<cufftComplex *>(d_rcFloat_void);
+  cufftComplex *d_out = reinterpret_cast<cufftComplex *>(d_azOut_void);
+  cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_void);
+
+  const size_t nelem = static_cast<size_t>(W) * static_cast<size_t>(M);
+
+  // prepare plan (length W, batch M)
+  cufftHandle plan;
+  int n[1] = { W };
+  int inembed[1] = { W };
+  int onembed[1] = { W };
+  int istride = M;
+  int ostride = M;
+  int idist = 1;
+  int odist = 1;
+  int batch = M;
+
+  CUFFT_CHECK(cufftPlanMany(&plan, 1, n,
+                            inembed, istride, idist,
+                            onembed, ostride, odist,
+                            CUFFT_C2C, batch));
+
+  if (stream)
+    CUFFT_CHECK(cufftSetStream(plan, stream));
+
+  // forward FFT in-place
+  CUFFT_CHECK(cufftExecC2C(plan, d_buf, d_buf, CUFFT_FORWARD));
+
+  CUFFT_CHECK(cufftDestroy(plan));
+
+  // compute combined shift
+  int k0 = 0;
+  if (W > 1) {
+    const float df = PRF / float(W - 1);
+    float pos = (fd_ctr + 0.5f * PRF) / df;
+    if (pos < 0.0f) pos = 0.0f;
+    if (pos > (float)(W - 1)) pos = (float)(W - 1);
+    k0 = int((pos >= 0.0f) ? pos + 0.5f : pos - 0.5f);
+  }
+  const int center0 = int(std::ceil(W / 2.0)) - 1;
+  const int shift_recentre = center0 - k0;
+  const int shift_fftshift = W / 2;
+  int total_shift = (shift_fftshift + shift_recentre) % W;
+  if (total_shift < 0) total_shift += W;
+
+  // circshift: read from d_buf, write into d_out (can be same pointer)
+  const int TX = 32, TY = 8;
+  dim3 block(TX, TY);
+  dim3 grid((M + TX - 1) / TX, (W + TY - 1) / TY);
+  circshift_rows_kernel<<<grid, block, 0, stream>>>(d_buf, d_out, W, M, total_shift);
+  CUDA_CHECK(cudaGetLastError());
+
+  if (stream)
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+  else
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+  return true;
+}
+
 bool azFftShiftAndRecenterCuFFT(const Image2D<std::complex<float>> &rc,
                                  float PRF, float fd_ctr,
                                  Image2D<std::complex<float>> &azOut)

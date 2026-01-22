@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <GMTI>
     <GMTI_parameter>
-        <GMTI_data>/home/shy/AIR/信号处理学习/data/Mission030/RawData/ID24_8H24M_GMTI0</GMTI_data>
-        <GMTI_data2>/home/shy/AIR/信号处理学习/data/Mission030/RawData/ID24_8H24M_GMTI1</GMTI_data2>
+        <GMTI_data>/home/shy/AIR/信号处理学习/data/Mission030/RawData/ID13_8H13M_GMTI0</GMTI_data>
+        <GMTI_data2>/home/shy/AIR/信号处理学习/data/Mission030/RawData/ID13_8H13M_GMTI1</GMTI_data2>
         <result_add>/home/shy/AIR/信号处理学习/data/Mission030/result_shy/</result_add>
         <Plane_POS>/home/shy/AIR/信号处理学习/data/Mission030/RTIPOS/RTIPOS_ID24.out</Plane_POS>
         <reffunc_add>/home/shy/AIR/信号处理学习/data/Mission030/RefFun_Br50MHz_Tr38us_Len4096.dat</reffunc_add>
@@ -51,6 +51,6 @@
         <raw_fenbianlv>8</raw_fenbianlv>
         <len_tiaoguo>200</len_tiaoguo>
         <week_offset>0</week_offset>
-        <squint_angle>3.3426618576049805</squint_angle>
+        <squint_angle>3.9176750183105469</squint_angle>
     </GMTI_parameter>
 </GMTI>

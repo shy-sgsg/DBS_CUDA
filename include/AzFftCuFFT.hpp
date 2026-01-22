@@ -11,3 +11,15 @@
 bool azFftShiftAndRecenterCuFFT(const Image2D<std::complex<float>> &rc,
                                  float PRF, float fd_ctr,
                                  Image2D<std::complex<float>> &azOut);
+
+// Device-oriented API: operate on device buffers (single-precision complex)
+// - `d_rcFloat` : device pointer to input data (cufftComplex), size W*M
+// - `W`, `M`    : dimensions
+// - `PRF`, `fd_ctr` : parameters for recentring
+// - `d_azOut`   : device pointer for output (cufftComplex), may be same as input
+// - `stream`    : cudaStream_t as void* or nullptr
+bool azFftShiftAndRecenterCuFFT_device(void *d_rcFloat,
+                                       int W, int M,
+                                       float PRF, float fd_ctr,
+                                       void *d_azOut,
+                                       void *stream);

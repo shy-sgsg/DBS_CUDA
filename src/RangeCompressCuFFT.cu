@@ -128,7 +128,18 @@ bool rangeCompressCuFFT(const Params &P,
                               howmany));
 
     // --- 4. 前向 FFT ---
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+    CUDA_CHECK(cudaEventRecord(start, 0));
     CUFFT_CHECK(cufftExecZ2Z(plan, D_inOut, D_inOut, CUFFT_FORWARD));
+    CUDA_CHECK(cudaEventRecord(stop, 0));
+    CUDA_CHECK(cudaEventSynchronize(stop));
+    float milliseconds = 0;
+    CUDA_CHECK(cudaEventElapsedTime(&milliseconds, start, stop));
+    std::cout << "cuFFT Forward FFT execution time: " << milliseconds << " ms" << std::endl;
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
 
     // --- 5. 频域乘法 Kernel ---
     int threadsPerBlock = 256;
@@ -165,6 +176,104 @@ bool rangeCompressCuFFT(const Params &P,
     CUDA_CHECK(cudaFree(D_inOut));
     CUDA_CHECK(cudaFree(D_HfSpec));
     CUDA_CHECK(cudaFree(D_rcOut));
+
+    return true;
+}
+
+// --------------------------------------------------
+// Kernel: convert cuDoubleComplex -> cufftComplex (double->float)
+// --------------------------------------------------
+__global__ void convertDoubleToFloatKernel(const cuDoubleComplex* src,
+                                           cufftComplex* dst,
+                                           size_t nelem)
+{
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < nelem) {
+        dst[i].x = static_cast<float>(src[i].x);
+        dst[i].y = static_cast<float>(src[i].y);
+    }
+}
+
+// Device-oriented implementation that operates on preallocated device buffers
+bool rangeCompressCuFFT_device_buffers(const Params &P,
+                                      void *d_inOut_void,
+                                      const void *d_HfSpec_void,
+                                      void *d_rcOut_void,
+                                      int W, int Lraw, int M,
+                                      void *stream_void)
+{
+    cuDoubleComplex *D_inOut = reinterpret_cast<cuDoubleComplex *>(d_inOut_void);
+    const cuDoubleComplex *D_HfSpec = reinterpret_cast<const cuDoubleComplex *>(d_HfSpec_void);
+    cuDoubleComplex *D_rcOut = reinterpret_cast<cuDoubleComplex *>(d_rcOut_void);
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_void);
+
+    if (Lraw % M != 0) {
+        std::cerr << "Lraw must be an integer multiple of M" << std::endl;
+        return false;
+    }
+
+    // create cuFFT plan and bind to stream
+    cufftHandle plan;
+    int rank = 1;
+    int n[1] = { Lraw };
+    int howmany = W;
+    CUFFT_CHECK(cufftPlanMany(&plan, rank, n,
+                              NULL, 1, Lraw,
+                              NULL, 1, Lraw,
+                              CUFFT_Z2Z,
+                              howmany));
+
+    if (stream)
+        CUFFT_CHECK(cufftSetStream(plan, stream));
+
+    // forward FFT
+    CUFFT_CHECK(cufftExecZ2Z(plan, D_inOut, D_inOut, CUFFT_FORWARD));
+
+    // multiply in frequency
+    int threadsPerBlock = 256;
+    int blocksPerGrid = (W * Lraw + threadsPerBlock - 1) / threadsPerBlock;
+    multiplyHfSpecKernel<<<blocksPerGrid, threadsPerBlock, 0, stream>>>(D_inOut, D_HfSpec, W, Lraw);
+    CUDA_CHECK(cudaGetLastError());
+
+    // inverse FFT
+    CUFFT_CHECK(cufftExecZ2Z(plan, D_inOut, D_inOut, CUFFT_INVERSE));
+
+    // normalize and crop
+    const int Lraw2M = Lraw / M;
+    const double scale = 1.0 / double(Lraw);
+    blocksPerGrid = (W * M + threadsPerBlock - 1) / threadsPerBlock;
+    normalizeAndCropKernel<<<blocksPerGrid, threadsPerBlock, 0, stream>>>(D_inOut, D_rcOut, W, Lraw, M, Lraw2M, scale);
+    CUDA_CHECK(cudaGetLastError());
+
+    // ensure completion on requested stream
+    if (stream)
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    else
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+    CUFFT_CHECK(cufftDestroy(plan));
+
+    return true;
+}
+
+bool convertDoubleToFloatDevice(const void *d_in_double_void,
+                                 void *d_out_float_void,
+                                 size_t nelem,
+                                 void *stream_void)
+{
+    const cuDoubleComplex *d_in_double = reinterpret_cast<const cuDoubleComplex *>(d_in_double_void);
+    cufftComplex *d_out_float = reinterpret_cast<cufftComplex *>(d_out_float_void);
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_void);
+
+    const int threadsPerBlock = 256;
+    const int blocks = (int)((nelem + threadsPerBlock - 1) / threadsPerBlock);
+    convertDoubleToFloatKernel<<<blocks, threadsPerBlock, 0, stream>>>(d_in_double, d_out_float, nelem);
+    CUDA_CHECK(cudaGetLastError());
+
+    if (stream)
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    else
+        CUDA_CHECK(cudaDeviceSynchronize());
 
     return true;
 }

@@ -119,6 +119,7 @@ set(SRC
   src/lodepng.cpp  # PNG写出
   src/RangeCompressCuFFT.cu  # cuFFT 距离脉压
   src/stitcher_kernel.cu  # GPU 全流程拼接 kernel
+  src/stitcher_kernel_texarray.cu  # GPU 纹理内存拼接 kernel
   # ... 其余源文件
 )
 

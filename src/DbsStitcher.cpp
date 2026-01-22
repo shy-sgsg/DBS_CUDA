@@ -227,7 +227,7 @@ bool DbsStitcher::nextGMTIFileNameTxt(const std::string &dir,
 
 bool DbsStitcher::loadPosAndEstimateVelocity(const Params &P, PosData &POS)
 {
-  // 读取 POS: 每帧 17 个 double
+  // 读取 POS: 每帧 7 个 double
   std::ifstream ifs(P.pos_path, std::ios::binary);
   if (!ifs)
     return false;
@@ -235,10 +235,10 @@ bool DbsStitcher::loadPosAndEstimateVelocity(const Params &P, PosData &POS)
   std::vector<double> buf(elems);
   while (ifs.read(reinterpret_cast<char *>(buf.data()), elems * sizeof(double)))
   {
-    POS.gpstime.push_back(buf[0]);
-    POS.lat_rad.push_back(buf[1]);
-    POS.lon_rad.push_back(buf[2]);
-    POS.alt_m.push_back(buf[3]);
+    POS.gpstime.push_back(buf[0]); // 时间戳
+    POS.lat_rad.push_back(buf[1]); // 纬度 (弧度)
+    POS.lon_rad.push_back(buf[2]); // 经度 (弧度)
+    POS.alt_m.push_back(buf[3]);   // 高度 (米)
   }
   size_t N = POS.gpstime.size();
   POS.vx.resize(N);
@@ -276,41 +276,41 @@ bool DbsStitcher::loadPosAndEstimateVelocity(const Params &P, PosData &POS)
   return true;
 }
 
-int DbsStitcher::estimateEffectiveAzBins(const Params &P, const PosData &POS)
-{
-  // 与 MATLAB 逻辑一致的估算（略简化）
-  double Rbin = c0() / (2.0 * P.fs_hz);
-  double air_h = (std::accumulate(POS.alt_m.begin(), POS.alt_m.end(), 0.0) / POS.alt_m.size()) - P.mean_ground_h;
-  double rmax = P.Rmin_m + P.range_samp_used * Rbin;
-  double max_cosphi = std::sqrt(std::max(0.0, 1.0 - (air_h / rmax) * (air_h / rmax)));
+  int DbsStitcher::estimateEffectiveAzBins(const Params &P, const PosData &POS)
+  {
+    // 与 MATLAB 逻辑一致的估算（略简化）
+    double Rbin = c0() / (2.0 * P.fs_hz);
+    double air_h = (std::accumulate(POS.alt_m.begin(), POS.alt_m.end(), 0.0) / POS.alt_m.size()) - P.mean_ground_h;
+    double rmax = P.Rmin_m + P.range_samp_used * Rbin;
+    double max_cosphi = std::sqrt(std::max(0.0, 1.0 - (air_h / rmax) * (air_h / rmax)));
 
-  int azN = std::max(1, int(std::floor(P.scan_max_az_deg)));
-  double max_delta_sin = 0;
-  for (int i = 1; i <= azN; i++)
-  {
-    double d = std::abs(std::sin((i + (P.beamwidth_deg + 1) / 2) * M_PI / 180.0) - std::sin((i - (P.beamwidth_deg + 1) / 2) * M_PI / 180.0));
-    max_delta_sin = std::max(max_delta_sin, d);
-  }
-  double lam = c0() / P.fc_hz;
-  double v_med = 0.0;
-  if (POS.speed.size() > 100) // 确保有足够的元素
-  {
-    // 从索引100到末尾
-    auto max_iter = std::max_element(POS.speed.begin() + 100, POS.speed.end());
-    if (max_iter != POS.speed.end())
+    int azN = std::max(1, int(std::floor(P.scan_max_az_deg)));
+    double max_delta_sin = 0;
+    for (int i = 1; i <= azN; i++)
     {
-      v_med = *max_iter;
+      double d = std::abs(std::sin((i + (P.beamwidth_deg + 1) / 2) * M_PI / 180.0) - std::sin((i - (P.beamwidth_deg + 1) / 2) * M_PI / 180.0));
+      max_delta_sin = std::max(max_delta_sin, d);
     }
+    double lam = c0() / P.fc_hz;
+    double v_med = 0.0;
+    if (POS.speed.size() > 100) // 确保有足够的元素
+    {
+      // 从索引100到末尾
+      auto max_iter = std::max_element(POS.speed.begin() + 100, POS.speed.end());
+      if (max_iter != POS.speed.end())
+      {
+        v_med = *max_iter;
+      }
+    }
+
+    double max_dopp = 2 * v_med / lam * max_delta_sin * max_cosphi;
+    int nEff = int(std::ceil(max_dopp / (1.0 * P.PRF / P.pulses_per_beam)));
+    nEff = int(std::floor(nEff * 1.4));
+    if (nEff % 2)
+      nEff++;
+
+    return nEff;
   }
-
-  double max_dopp = 2 * v_med / lam * max_delta_sin * max_cosphi;
-  int nEff = int(std::ceil(max_dopp / (1.0 * P.PRF / P.pulses_per_beam)));
-  nEff = int(std::floor(nEff * 1.4));
-  if (nEff % 2)
-    nEff++;
-
-  return nEff;
-}
 
 bool DbsStitcher::estimateMosaicExtent(const Params &P, const RDData &RD, const MetaPack &meta,
                                        Bounds &b, Grid &grid)

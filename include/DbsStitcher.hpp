@@ -45,7 +45,8 @@ public:
   // (e.g. `rangeCompressCuFFT`) and reduce redundant host work.
   // This function keeps the original `processAllBeams` intact so callers
   // can choose CPU or GPU processing explicitly.
-  bool processAllBeamsGPU(Params &P, const PosData &POS, RDData &RD, MetaPack &meta);
+  bool processAllBeamsGPU1(Params &P, const PosData &POS, RDData &RD, MetaPack &meta);
+  bool processAllBeamsGPU2(Params &P, const PosData &POS, RDData &RD, MetaPack &meta);
 
   bool updateFdCtrEstimates(Params &P, RDData &RD, MetaPack &meta, const std::string &xmlPath);
 
@@ -57,8 +58,9 @@ public:
 
   // GPU-accelerated version of buildMosaic. Preserves the original API but
   // performs batched bilinear interpolation and other hot paths on the GPU.
+  // useTexInterp: 是否用纹理内存进行硬件双线性插值
   bool buildMosaicGPU(const Params &P, const RDData &RD, const MetaPack &meta,
-                      const Grid &grid, Mosaic &mosaic);
+                      const Grid &grid, Mosaic &mosaic, bool useTexInterp = false);
 
   bool writeProducts(const Params &P, const Grid &grid, const Mosaic &mosaic, const Bounds &b);
 

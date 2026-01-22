@@ -9,6 +9,8 @@
 #include <cuda_runtime.h>
 #include <iostream>
 
+#include "PerfLogger.hpp"
+
 
 // 简易 clamp（C++11 里没有 std::clamp）
 static inline int clamp_int(int v, int lo, int hi)
@@ -28,6 +30,11 @@ bool DbsStitcher::buildMosaic(const Params &P,
                               const Grid &grid,
                               Mosaic &mosaic)
 {
+  const std::string algoGroup = "BuildMosaic";
+  PerfLogger::Timer t_stage, t_total;
+  // t_total.start();
+
+  t_stage.start();
   const int B = (int)meta.beams.size();                   // bowei_num
   const int M = (RD.amp.empty() ? 0 : RD.amp[0].cols);    // range_samp_used
   const int nEff = (RD.amp.empty() ? 0 : RD.amp[0].rows); // f_youxiao
@@ -240,17 +247,21 @@ bool DbsStitcher::buildMosaic(const Params &P,
 }
 
 // GPU-accelerated variant: batched queries + device-resident amplitude buffers.
+// useTexInterp: 是否用纹理内存进行硬件双线性插值
 bool DbsStitcher::buildMosaicGPU(const Params &P,
                                  const RDData &RD,
                                  const MetaPack &meta,
                                  const Grid &grid,
-                                 Mosaic &mosaic)
+                                 Mosaic &mosaic,
+                                 bool useTexInterp)
 {
   const int B = (int)meta.beams.size();
   const int M = (RD.amp.empty() ? 0 : RD.amp[0].cols);
   const int nEff = (RD.amp.empty() ? 0 : RD.amp[0].rows);
   const int nx = (int)grid.x.size();
   const int ny = (int)grid.y.size();
+  printf("Mosaic Build: B=%d, M=%d, nEff=%d, nx=%d, ny=%d\n",
+         B, M, nEff, nx, ny);
   if (B <= 0 || M <= 0 || nEff <= 0 || nx <= 0 || ny <= 0)
     return false;
 
@@ -380,19 +391,23 @@ bool DbsStitcher::buildMosaicGPU(const Params &P,
   cudaMemcpy(d_grid_y, grid.y.data(), sizeof(float) * (size_t)ny, cudaMemcpyHostToDevice);
 
   // 4) launch kernel
+  PerfLogger::Timer t_kernel; t_kernel.start();
   dim3 block(16, 16);
   dim3 gsize((nx + block.x - 1) / block.x, (ny + block.y - 1) / block.y);
 
   int flag_base = flag;
 
   launchBuildMosaicKernel(
-      d_amp_mosaic, d_which_beam, d_all_amps,
-      d_grid_x, d_grid_y, d_beams,
-      nx, ny, B, M, nEff,
-      (float)P.Rmin_m, R_bin, lambda, Height, flag_base
+    d_amp_mosaic, d_which_beam, d_all_amps,
+    d_grid_x, d_grid_y, d_beams,
+    nx, ny, B, M, nEff,
+    (float)P.Rmin_m, R_bin, lambda, Height, flag_base,
+    useTexInterp
   );
 
   cudaDeviceSynchronize();
+  double t_kernel_ms = t_kernel.stop_ms();
+  PerfLogger::add("buildMosaic_kernel", t_kernel_ms);
 
   // 5) copy results back
   mosaic.amp = Image2D<float>(ny, nx);

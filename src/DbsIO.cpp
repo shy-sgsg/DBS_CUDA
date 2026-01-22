@@ -1,6 +1,8 @@
 #include "DbsIO.hpp"
 #include <cstdio>
 #include <cstring>
+#include <chrono>
+#include <iostream>
 #include <fftw3.h>
 #include <stdexcept>
 #include <thread>
@@ -258,7 +260,12 @@ bool rangeCompressFFT(const Params &P,
   }
 
   // ---------- (4) 前向 FFT（内部可多线程） ----------
+  auto start = std::chrono::high_resolution_clock::now();
   fftw_execute(fwd);
+  auto end = std::chrono::high_resolution_clock::now();
+  std::chrono::duration<double, std::milli> elapsed = end - start;
+  std::cout << "FFTW execution time: " << elapsed.count() << " ms" << std::endl;
+
   // ---------- (5) 频域乘以 conj(HfSpec)（行并行） ----------
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)

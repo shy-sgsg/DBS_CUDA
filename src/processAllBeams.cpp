@@ -9,6 +9,8 @@
 #include <stdexcept>
 #include "unwrap_fd.hpp"
 #include "AzFftCuFFT.hpp"
+#include <cuda_runtime.h>
+#include "PerfLogger.hpp"
 
 // 光速（避免依赖外部 c0()）
 static inline float c0f_local() { return 299792458.0f; }
@@ -78,70 +80,191 @@ buildHfSpecFromParams(const Params &P)
     return buildHfSpec(N, fs, Kr);
 }
 
-bool DbsStitcher::processAllBeams(Params &P,
-                                  const PosData &POS,
-                                  RDData &RD,
-                                  MetaPack &meta)
+bool DbsStitcher::processAllBeams(Params &P, const PosData &POS, RDData &RD, MetaPack &meta)
 {
+  const std::string algoGroup = "ProcessAllBeams";
+  PerfLogger::Timer t_stage, t_total;
+  // t_total.start();
+
+  t_stage.start();
+  const int B = P.beams_per_period;
+  const int N = P.beam_skip;
+  const int W = P.pulses_per_beam;
+  const int M = P.range_samp_used;
+  const int B_count = (int)std::ceil(B / std::max(1, N));
+
+  // ---- 预分配 ----
+  RD.nEff = (RD.nEff > 0) ? RD.nEff : estimateEffectiveAzBins(P, POS);
+  RD.amp.resize(B_count);
+  RD.fd_axis.resize(B_count);
+  RD.rg_axis.resize(B_count);
+  meta.beams.resize(B_count);
+
+  // ---- 斜距轴生成 ----
+  P.fs_hz = P.fs_hz * (static_cast<double>(M) / static_cast<double>(P.range_samp_total));
+  const float Rbin = c0f_local() / (2.0f * static_cast<float>(P.fs_hz));
+  std::vector<float> rg_axis_row(M);
+  for (int m = 0; m < M; ++m) rg_axis_row[m] = static_cast<float>(P.Rmin_m) + m * Rbin;
+
+  PerfLogger::add("PrecomputeSetup", t_stage.stop_ms(), algoGroup);
+
+  // ===== 主循环：逐波位处理 =====
+  for (int b = 0; b < B_count; ++b)
+  {
+    // CPU_01. 读取原始数据 
+    t_stage.start();
+    BeamRaw<double> raw;
+    int p = b * std::max(1, N) + 1;
+    if (!readBeamRaw(P, p, raw)) return false;
+    PerfLogger::add("ReadRaw_IO", t_stage.stop_ms(), algoGroup);
+
+    // CPU_02. 距离脉压
+    std::vector<std::complex<double>> rc;
+    if (!P.isPC)
+    {
+      std::vector<std::complex<double>> HfSpec = buildHfSpecFromParams(P);
+      t_stage.start();
+      if (!rangeCompressFFT(P, raw, HfSpec, rc)) return false;
+      PerfLogger::add("RangeCompress", t_stage.stop_ms(), algoGroup);
+    }
+
+    // CPU_03. UTC 时间调整 
+    t_stage.start();
+    double mean_utc = 0.0;
+    for(auto t : raw.t_utc) mean_utc += t;
+    if(!raw.t_utc.empty()) mean_utc /= (double)raw.t_utc.size();
+    for(size_t i=0; i<raw.t_utc.size(); ++i) {
+        if(mean_utc - raw.t_utc[i] > 0.8) raw.t_utc[i] += 1;
+    }
+    PerfLogger::add("UTC_Adjustment", t_stage.stop_ms(), algoGroup);
+
+    // CPU_04. POS 映射 
+    t_stage.start();
+    MapPosResult mpos;
+    if (!mapPosToBeam(raw.t_utc, POS, mpos)) { /* fallback */ }
+    PerfLogger::add("PosMapping", t_stage.stop_ms(), algoGroup);
+
+    // CPU_05. Meta 初始化
+    t_stage.start();
+    MetaPerBeam m;
+    m.vN = mpos.vN; m.vE = mpos.vE; m.vU = mpos.vU;
+    m.x = mpos.xyz0[0]; m.y = mpos.xyz0[1]; m.z = mpos.xyz0[2];
+    if (!raw.fw_angle_deg.empty()) {
+      float sum = std::accumulate(raw.fw_angle_deg.begin(), raw.fw_angle_deg.end(), 0.0f);
+      m.angle_deg = sum / static_cast<float>(raw.fw_angle_deg.size());
+    } else {
+      m.angle_deg = 0.0f;
+    }
+    PerfLogger::add("MetaInit", t_stage.stop_ms(), algoGroup);
+
+    // CPU_06. 多普勒频率中心估计 & 方位向 FFT 
+    t_stage.start();
+    const double speed = std::sqrt(m.vN * m.vN + m.vE * m.vE + m.vU * m.vU);
+    const double lambda = c0f_local() / static_cast<double>(P.fc_hz);
+    std::vector<double> fd_ctr_vec = estimateFdCenter(rc, W, M, P.PRF, speed, raw.fw_angle_deg, lambda, 1);
+    m.fd_ctr = (float)fd_ctr_vec[1];
+    meta.beams[b].fd_ctr = m.fd_ctr;
+
+    Image2D<std::complex<float>> rcImg(W, M);
+    for (int r = 0; r < W; ++r) {
+      for (int c = 0; c < M; ++c) {
+        rcImg.at(r, c) = static_cast<std::complex<float>>(rc[static_cast<size_t>(r) * M + c]);
+      }
+    }
+
+    Image2D<std::complex<float>> azSpec;
+    if (!azFftShiftAndRecenter(rcImg, static_cast<float>(P.PRF), m.fd_ctr, azSpec)) return false;
+    PerfLogger::add("Az FFT", t_stage.stop_ms(), algoGroup);
+
+    // CPU_07. 有效通道切片 
+    t_stage.start();
+    Image2D<float> amp_eff;
+    std::vector<float> fd_axis_eff;
+    if (!sliceEffectiveAzBins(azSpec, 0.0f, RD.nEff, static_cast<float>(P.PRF), amp_eff, fd_axis_eff)) return false;
+    PerfLogger::add("AzimuthSlice_Amp", t_stage.stop_ms(), algoGroup);
+
+    // 保存结果
+    RD.amp[b] = amp_eff;
+    RD.fd_axis[b] = fd_axis_eff;
+    RD.rg_axis[b] = rg_axis_row;
+    meta.beams[b] = m;
+  }
+
+  // PerfLogger::add("CPU_ALL_BEAMS_DONE", t_total.stop_ms(), algoGroup);
+  return true;
+}
+
+bool DbsStitcher::processAllBeamsGPU1(Params &P,
+                                     const PosData &POS,
+                                     RDData &RD,
+                                     MetaPack &meta)
+{
+  const std::string algoGroup = "ProcessAllBeams";
+  PerfLogger::Timer t_stage, t_total;
+  // t_total.start();
+
+  t_stage.start();
   const int B = P.beams_per_period;
   const int N = P.beam_skip;
   const int W = P.pulses_per_beam;
   const int M = P.range_samp_used;
 
-  const int B_count = (int)std::ceil(B / std::max(1, N)); // 实际处理的波位数
+  const int B_count = (int)std::ceil(B / std::max(1, N));
+
+  // Work on a local copy of Params so we don't permanently mutate caller's
+  // values while still applying the same sampling-rate adjustment used by the
+  // CPU path.
+  Params P2 = P;
+  P2.fs_hz = P.fs_hz * (static_cast<double>(M) / static_cast<double>(P.range_samp_total));
 
   // ---- 预分配 ----
-  RD.nEff = (RD.nEff > 0) ? RD.nEff : estimateEffectiveAzBins(P, POS);
-  RD.amp.resize(B_count);     // 每个元素: nEff x M
-  RD.fd_axis.resize(B_count); // 每个元素: 1 x nEff（std::vector<float>）
-  RD.rg_axis.resize(B_count); // 每个元素: 1 x M   （std::vector<float>）
+  RD.nEff = (RD.nEff > 0) ? RD.nEff : estimateEffectiveAzBins(P2, POS);
+  RD.amp.resize(B_count);
+  RD.fd_axis.resize(B_count);
+  RD.rg_axis.resize(B_count);
   meta.beams.resize(B_count);
 
   // ---- 斜距轴（每波位相同，直接预生成一个 row 复用）----
-  P.fs_hz = P.fs_hz * (static_cast<double>(M) / static_cast<double>(P.range_samp_total)); // 更新采样率
-  const float Rbin = c0f_local() / (2.0f * static_cast<float>(P.fs_hz));
-  std::vector<float> rg_axis_row;
-  rg_axis_row.resize(M);
+  const float Rbin = c0f_local() / (2.0f * static_cast<float>(P2.fs_hz));
+  std::vector<float> rg_axis_row(M);
   for (int m = 0; m < M; ++m)
-  {
     rg_axis_row[m] = static_cast<float>(P.Rmin_m) + m * Rbin;
-  }
+
+  // Precompute HfSpec once when performing GPU range compression to avoid
+  // rebuilding the same spec for every beam. This uses the adjusted sampling
+  // rate in P2.
+  std::vector<std::complex<double>> HfSpecGlobal;
+  if (!P2.isPC)
+    HfSpecGlobal = buildHfSpecFromParams(P2);
+  
+  PerfLogger::add("PrecomputeSetup", t_stage.stop_ms(), algoGroup);  
 
   // ===== 主循环：逐波位处理 =====
   for (int b = 0; b < B_count; ++b)
   {
-    // -------------------- (a) 读单波位 & 距离脉压 --------------------
+    PerfLogger::Timer t_beam; t_beam.start();
+
+    // (a) 读单波位 & 距离脉压（GPU：rangeCompressCuFFT）
+    t_stage.start();
     BeamRaw<double> raw;
-    int p = b * std::max(1, N) + 1; // 实际波位索引
+    int p = b * std::max(1, N) + 1;
     if (!readBeamRaw(P, p, raw))
     {
       std::fprintf(stderr, "[ERR] readBeamRaw failed on beam %d\n", b);
       return false;
     }
+    PerfLogger::add("ReadRaw_IO", t_stage.stop_ms(), algoGroup);
 
     std::vector<std::complex<double>> rc; // W*M，行主（每行一脉冲）
-    if (!P.isPC)
+    if (!P2.isPC)
     {
-      std::vector<std::complex<double>> HfSpec = buildHfSpecFromParams(P);
-
-      // --- 计时开始 ---
-      auto start_time = std::chrono::high_resolution_clock::now();
-
-      if (!rangeCompressFFT(P, raw, HfSpec, rc))
+      t_stage.start();
+      if (!rangeCompressCuFFT(P2, raw, HfSpecGlobal, rc))
       {
         std::fprintf(stderr, "[ERR] rangeCompressCuFFT failed on beam %d\n", b);
         return false;
       }
-
-      // --- 计时结束 ---
-      auto end_time = std::chrono::high_resolution_clock::now();
-
-      // 计算持续时间 (单位：毫秒)
-      std::chrono::duration<double, std::milli> duration = end_time - start_time;
-      
-      // 打印结果
-      // std::cout << "[TIMER] Beam " << b << " rangeCompressCuFFT took: "
-      //           << duration.count() << " ms" << std::endl;
+      PerfLogger::add("RangeCompress", t_stage.stop_ms(), algoGroup);
     }
     else
     {
@@ -156,27 +279,31 @@ bool DbsStitcher::processAllBeams(Params &P,
         }
       }
     }
-    // 调整 UTC 时间
-    double mean_utc = 0.0;
-    for(size_t i=0;i<raw.t_utc.size();++i){
-      mean_utc += raw.t_utc[i];
-    }
-    mean_utc /= static_cast<double>(raw.t_utc.size());
-    for(size_t i=0;i<raw.t_utc.size();++i){
-      if(mean_utc - raw.t_utc[i] > 0.8)
-        raw.t_utc[i] += 1;
-    }
 
-    // -------------------- (b) POS 就近映射到脉冲时间 --------------------
+    // 调整 UTC 时间（与 CPU 路径一致）
+    t_stage.start();
+    double mean_utc = 0.0;
+    for (size_t i = 0; i < raw.t_utc.size(); ++i)
+      mean_utc += raw.t_utc[i];
+    mean_utc /= static_cast<double>(raw.t_utc.size());
+    for (size_t i = 0; i < raw.t_utc.size(); ++i)
+      if (mean_utc - raw.t_utc[i] > 0.8)
+        raw.t_utc[i] += 1;
+    PerfLogger::add("UTC_Adjustment", t_stage.stop_ms(), algoGroup);
+
+    // (b) POS 映射到脉冲时间
+    t_stage.start();
     MapPosResult mpos;
     if (!mapPosToBeam(raw.t_utc, POS, mpos))
     {
       std::fprintf(stderr, "[WARN] mapPosToBeam failed; fallback to global means\n");
-      std::vector<double> empty; // 触发退化路径
+      std::vector<double> empty;
       mapPosToBeam(empty, POS, mpos);
     }
+    PerfLogger::add("PosMapping", t_stage.stop_ms(), algoGroup);
 
     // meta 初始化
+    t_stage.start();
     MetaPerBeam m;
     m.vN = mpos.vN;
     m.vE = mpos.vE;
@@ -184,9 +311,6 @@ bool DbsStitcher::processAllBeams(Params &P,
     m.x = mpos.xyz0[0];
     m.y = mpos.xyz0[1];
     m.z = mpos.xyz0[2];
-    //DBG("Beam " << b << " mapped POS: vN=" << m.vN << " vE=" << m.vE
-    //    << " vU=" << m.vU << " x=" << m.x << " y=" << m.y << " z=" << m.z);
-    // 波束角平均
     if (!raw.fw_angle_deg.empty())
     {
       float sum = std::accumulate(raw.fw_angle_deg.begin(), raw.fw_angle_deg.end(), 0.0f);
@@ -196,76 +320,75 @@ bool DbsStitcher::processAllBeams(Params &P,
     {
       m.angle_deg = 0.0f;
     }
+    PerfLogger::add("MetaInit", t_stage.stop_ms(), algoGroup);
 
-    // -------------------- (c) f_d 估计与模糊修正 --------------------
+    // (c) f_d 估计与模糊修正（保持原算法）
+    t_stage.start();
     const double speed = std::sqrt(m.vN * m.vN + m.vE * m.vE + m.vU * m.vU);
-    const double lambda = c0f_local() / static_cast<double>(P.fc_hz);
+    const double lambda = c0f_local() / static_cast<double>(P2.fc_hz);
     std::vector<double> fd_ctr = estimateFdCenter(rc,
-                                P.pulses_per_beam,
-                                P.range_samp_used,
-                                P.PRF,
+                                P2.pulses_per_beam,
+                                P2.range_samp_used,
+                                P2.PRF,
                                 speed,
                                 raw.fw_angle_deg,
-                                lambda, // lambda
+                                lambda,
                                 1 /*method*/);
     m.fd_ctr = fd_ctr[1];
     meta.beams[b].fd_ctr = m.fd_ctr;
-    DBG("Beam " << b << " estimated fd_ctr=" << m.fd_ctr << " Hz");
-    // -------------------- (d) 方位 FFT + 频率重心移零 --------------------
-    // rc: W x M（行主）→ 先装入 Image2D，再 FFT&recentre
-    Image2D<std::complex<float>> rcImg(W, M);
-    {
-      if (static_cast<int>(rc.size()) != W * M)
-      {
-        std::fprintf(stderr, "[ERR] rc size mismatch on beam %d\n", b);
-        return false;
-      }
-      for (int r = 0; r < W; ++r)
-      {
-        for (int c = 0; c < M; ++c)
-        {
-          rcImg.at(r, c) = static_cast<std::complex<float>>(rc[static_cast<size_t>(r) * M + c]);
-        }
-      }
-    }
 
-    Image2D<std::complex<float>> azSpec; // W x M, 复数谱（已 recentre 使 fd~0 在中心）
-    if (!azFftShiftAndRecenter(rcImg, static_cast<float>(P.PRF), m.fd_ctr, azSpec))
+    // (d) 方位 FFT + 频率重心移零
+    Image2D<std::complex<float>> rcImg(W, M);
+    if (static_cast<int>(rc.size()) != W * M)
     {
-      std::fprintf(stderr, "[ERR] azFftShiftAndRecenter failed on beam %d\n", b);
+      std::fprintf(stderr, "[ERR] rc size mismatch on beam %d\n", b);
       return false;
     }
+    for (int r = 0; r < W; ++r)
+      for (int c = 0; c < M; ++c)
+        rcImg.at(r, c) = static_cast<std::complex<float>>(rc[static_cast<size_t>(r) * M + c]);
 
-    // -------------------- (f) 裁剪有效方位通道 --------------------
-    Image2D<float> amp_eff;         // nEff x M 幅度
-    std::vector<float> fd_axis_eff; // 1 x nEff
-    if (!sliceEffectiveAzBins(azSpec, 0.0f, RD.nEff, static_cast<float>(P.PRF),
+    Image2D<std::complex<float>> azSpec;
+    if (!azFftShiftAndRecenterCuFFT(rcImg, static_cast<float>(P2.PRF), m.fd_ctr, azSpec))
+    {
+      std::fprintf(stderr, "[ERR] azFftShiftAndRecenterCuFFT failed on beam %d\n", b);
+      return false;
+    }
+    PerfLogger::add("Az FFT", t_stage.stop_ms(), algoGroup);
+
+    // (f) 裁剪有效方位通道
+    t_stage.start();
+    Image2D<float> amp_eff;
+    std::vector<float> fd_axis_eff;
+    if (!sliceEffectiveAzBins(azSpec, 0.0f, RD.nEff, static_cast<float>(P2.PRF),
                               amp_eff, fd_axis_eff))
     {
       std::fprintf(stderr, "[ERR] sliceEffectiveAzBins failed on beam %d\n", b);
       return false;
     }
+    PerfLogger::add("AzimuthSlice_Amp", t_stage.stop_ms(), algoGroup);
 
-    // ---- 写回 RD / meta ----
-    RD.amp[b] = amp_eff;         // nEff x M
-    RD.fd_axis[b] = fd_axis_eff; // 1 x nEff
-    RD.rg_axis[b] = rg_axis_row; // 1 x M
+    // 写回 RD / meta
+    RD.amp[b] = amp_eff;
+    RD.fd_axis[b] = fd_axis_eff;
+    RD.rg_axis[b] = rg_axis_row;
     meta.beams[b] = m;
   }
 
+  // PerfLogger::add("GPU1_ALL_BEAMS_DONE", t_total.stop_ms(), algoGroup);
   return true;
 }
 
-// GPU-optimized version of processAllBeams. This function preserves the
-// original behavior but reorganizes some steps to reduce redundant work and
-// to call GPU-accelerated helpers where available (e.g. `rangeCompressCuFFT`).
-// It intentionally keeps error handling and output layout identical to the
-// CPU version so that the rest of the pipeline can remain unchanged.
-bool DbsStitcher::processAllBeamsGPU(Params &P,
+bool DbsStitcher::processAllBeamsGPU2(Params &P,
                                      const PosData &POS,
                                      RDData &RD,
                                      MetaPack &meta)
 {
+  const std::string algoGroup = "ProcessAllBeams";
+  PerfLogger::Timer t_stage, t_total;
+  // t_total.start();
+
+  t_stage.start();
   const int B = P.beams_per_period;
   const int N = P.beam_skip;
   const int W = P.pulses_per_beam;
@@ -299,58 +422,103 @@ bool DbsStitcher::processAllBeamsGPU(Params &P,
   if (!P2.isPC)
     HfSpecGlobal = buildHfSpecFromParams(P2);
 
+  // If GPU path: preallocate persistent device buffers and create a stream
+  void *d_HfSpec = nullptr;
+  void *d_inDouble = nullptr; // cuDoubleComplex* on device
+  void *d_rcDouble = nullptr; // cuDoubleComplex* on device (W*M)
+  void *d_rcFloat = nullptr;  // cufftComplex* on device (W*M)
+  void *d_azFloat = nullptr;  // cufftComplex* on device (W*M) after az FFT
+  cudaStream_t stream = nullptr;
+  size_t size_hfspec_bytes = 0;
+  size_t size_in_bytes = 0;
+  size_t size_rc_bytes = 0;
+
+  if (!P2.isPC) {
+    // sizes depend on raw.Lraw which may vary per beam; allocate using worst-case
+    // using P2.range_samp_total as an upper bound for Lraw
+    int Lraw_max = P2.range_samp_total;
+    int Lraw = Lraw_max;
+    int Wloc = P2.pulses_per_beam;
+    int Mloc = P2.range_samp_used;
+    size_hfspec_bytes = (size_t)Lraw * sizeof(std::complex<double>);
+    size_in_bytes = (size_t)Wloc * Lraw * sizeof(std::complex<double>);
+    size_rc_bytes = (size_t)Wloc * Mloc * sizeof(std::complex<double>);
+
+    if (HfSpecGlobal.size() == (size_t)Lraw) {
+      if (cudaMalloc(&d_HfSpec, size_hfspec_bytes) != cudaSuccess) {
+        std::fprintf(stderr, "[ERR] cudaMalloc d_HfSpec failed\n");
+        return false;
+      }
+    }
+
+    if (cudaMalloc(&d_inDouble, size_in_bytes) != cudaSuccess) {
+      std::fprintf(stderr, "[ERR] cudaMalloc d_inDouble failed\n");
+      return false;
+    }
+    if (cudaMalloc(&d_rcDouble, size_rc_bytes) != cudaSuccess) {
+      std::fprintf(stderr, "[ERR] cudaMalloc d_rcDouble failed\n");
+      return false;
+    }
+    if (cudaMalloc(&d_rcFloat, size_rc_bytes / sizeof(std::complex<double>) * sizeof(std::complex<float>)) != cudaSuccess) {
+      std::fprintf(stderr, "[ERR] cudaMalloc d_rcFloat failed\n");
+      return false;
+    }
+    if (cudaMalloc(&d_azFloat, size_rc_bytes / sizeof(std::complex<double>) * sizeof(std::complex<float>)) != cudaSuccess) {
+      std::fprintf(stderr, "[ERR] cudaMalloc d_azFloat failed\n");
+      return false;
+    }
+
+    if (cudaStreamCreate(&stream) != cudaSuccess) {
+      std::fprintf(stderr, "[ERR] cudaStreamCreate failed\n");
+      return false;
+    }
+
+    // copy HfSpecGlobal to device if available
+    if (d_HfSpec && !HfSpecGlobal.empty()) {
+      // HfSpecGlobal is std::complex<double>; device function expects cuDoubleComplex layout compatible
+      if (cudaMemcpyAsync(d_HfSpec, HfSpecGlobal.data(), size_hfspec_bytes, cudaMemcpyHostToDevice, stream) != cudaSuccess) {
+        std::fprintf(stderr, "[ERR] cudaMemcpyAsync HfSpec failed\n");
+        return false;
+      }
+      cudaStreamSynchronize(stream);
+    }
+  }
+  PerfLogger::add("PrecomputeSetup", t_stage.stop_ms(), algoGroup);
+
   // ===== 主循环：逐波位处理 =====
   for (int b = 0; b < B_count; ++b)
   {
-    // (a) 读单波位 & 距离脉压（GPU：rangeCompressCuFFT）
+    // 与 GPU1 保持一致的波位索引
+    t_stage.start();
     BeamRaw<double> raw;
-    int p = b * std::max(1, N) + 1;
+    int p = b * std::max(1, N) + 1; // 保证与 GPU1 一致
     if (!readBeamRaw(P, p, raw))
     {
       std::fprintf(stderr, "[ERR] readBeamRaw failed on beam %d\n", b);
       return false;
     }
+    PerfLogger::add("ReadRaw_IO", t_stage.stop_ms(), algoGroup);
 
+    t_stage.start();
     std::vector<std::complex<double>> rc; // W*M，行主（每行一脉冲）
-    if (!P2.isPC)
-    {
-      // Use GPU-based range compression. The implementation of
-      // rangeCompressCuFFT is expected to perform FFTs on the device and
-      // return the range-compressed rows into `rc` on the host.
-      auto start_time = std::chrono::high_resolution_clock::now();
-      if (!rangeCompressCuFFT(P2, raw, HfSpecGlobal, rc))
-      {
-        std::fprintf(stderr, "[ERR] rangeCompressCuFFT failed on beam %d\n", b);
-        return false;
-      }
-      auto end_time = std::chrono::high_resolution_clock::now();
-      std::chrono::duration<double, std::milli> duration = end_time - start_time;
-      DBG("Beam " << b << " rangeCompressCuFFT took: " << duration.count() << " ms");
-    }
-    else
-    {
-      const int Lraw = raw.Lraw;
-      const int Lraw2M = Lraw / M;
-      rc.resize((size_t)W * M);
-      for (int k = 0; k < W; ++k)
-      {
-        for (int m = 0; m < M; ++m)
-        {
-          rc[(size_t)k * M + m] = raw.s[(size_t)k * Lraw + m * Lraw2M];
-        }
-      }
-    }
+    // prepare per-beam sizes
+    const int Lraw = raw.Lraw;
+    const int Wloc = raw.W;
+    const int Mloc = P2.range_samp_used;
 
     // 调整 UTC 时间（与 CPU 路径一致）
     double mean_utc = 0.0;
     for (size_t i = 0; i < raw.t_utc.size(); ++i)
       mean_utc += raw.t_utc[i];
-    mean_utc /= static_cast<double>(raw.t_utc.size());
+    if (!raw.t_utc.empty())
+      mean_utc /= static_cast<double>(raw.t_utc.size());
     for (size_t i = 0; i < raw.t_utc.size(); ++i)
       if (mean_utc - raw.t_utc[i] > 0.8)
         raw.t_utc[i] += 1;
+    PerfLogger::add("UTC_Adjustment", t_stage.stop_ms(), algoGroup);
 
-    // (b) POS 映射到脉冲时间
+    // (b) POS 映射到脉冲时间 -- moved earlier so fd estimation can use meta
+    t_stage.start();
     MapPosResult mpos;
     if (!mapPosToBeam(raw.t_utc, POS, mpos))
     {
@@ -358,8 +526,10 @@ bool DbsStitcher::processAllBeamsGPU(Params &P,
       std::vector<double> empty;
       mapPosToBeam(empty, POS, mpos);
     }
+    PerfLogger::add("PosMapping", t_stage.stop_ms(), algoGroup);
 
-    // meta 初始化
+    // meta 初始化 (we need m for speed/lambda before fd estimation)
+    t_stage.start();
     MetaPerBeam m;
     m.vN = mpos.vN;
     m.vE = mpos.vE;
@@ -376,41 +546,179 @@ bool DbsStitcher::processAllBeamsGPU(Params &P,
     {
       m.angle_deg = 0.0f;
     }
+    PerfLogger::add("MetaInit", t_stage.stop_ms(), algoGroup);
 
-    // (c) f_d 估计与模糊修正（保持原算法）
+    // --- fd_ctr估计必须在rc有数据后 ---
     const double speed = std::sqrt(m.vN * m.vN + m.vE * m.vE + m.vU * m.vU);
     const double lambda = c0f_local() / static_cast<double>(P2.fc_hz);
-    std::vector<double> fd_ctr = estimateFdCenter(rc,
-                                P2.pulses_per_beam,
-                                P2.range_samp_used,
-                                P2.PRF,
-                                speed,
-                                raw.fw_angle_deg,
-                                lambda,
-                                1 /*method*/);
-    m.fd_ctr = fd_ctr[1];
-    meta.beams[b].fd_ctr = m.fd_ctr;
-    DBG("Beam " << b << " estimated fd_ctr=" << m.fd_ctr << " Hz");
+    if (!P2.isPC) {
+      // ...existing code...
+      t_stage.start();
+      // GPU pipeline: async copy input to device, run device buffers pipeline,
+      // then copy minimal result back (az spec) for host-side slicing.
+      const int Lraw = raw.Lraw;
+      const int Wloc = raw.W;
+      const int Mloc = P2.range_samp_used;
+
+      std::vector<std::complex<double>> h_inData((size_t)Wloc * Lraw);
+      for (int i = 0; i < Wloc * Lraw; ++i)
+        h_inData[i] = raw.s[i];
+
+      size_t this_in_bytes = (size_t)Wloc * Lraw * sizeof(std::complex<double>);
+      size_t this_rc_bytes = (size_t)Wloc * Mloc * sizeof(std::complex<double>);
+
+      if (cudaMemcpyAsync(d_inDouble, h_inData.data(), this_in_bytes, cudaMemcpyHostToDevice, stream) != cudaSuccess) {
+        std::fprintf(stderr, "[ERR] cudaMemcpyAsync input failed on beam %d\n", b);
+        return false;
+      }
+      void *d_HfPtr = d_HfSpec;
+      if (!rangeCompressCuFFT_device_buffers(P2, d_inDouble, d_HfPtr, d_rcDouble, Wloc, Lraw, Mloc, stream)) {
+        std::fprintf(stderr, "[ERR] rangeCompressCuFFT_device_buffers failed on beam %d\n", b);
+        return false;
+      }
+      rc.resize((size_t)Wloc * Mloc);
+      size_t this_rc_bytes_host = (size_t)Wloc * Mloc * sizeof(std::complex<double>);
+      if (cudaMemcpyAsync(rc.data(), d_rcDouble, this_rc_bytes_host, cudaMemcpyDeviceToHost, stream) != cudaSuccess) {
+        std::fprintf(stderr, "[ERR] cudaMemcpyAsync rc copy failed on beam %d\n", b);
+        return false;
+      }
+      if (cudaStreamSynchronize(stream) != cudaSuccess) {
+        std::fprintf(stderr, "[ERR] cudaStreamSynchronize failed on beam %d\n", b);
+        return false;
+      }
+      // --- 关键修正：此时rc已有效 ---
+      std::vector<double> fd_res = estimateFdCenter(rc, Wloc, Mloc, P2.PRF, speed, raw.fw_angle_deg, lambda, 1);
+      m.fd_ctr = (fd_res.size() > 1) ? (float)fd_res[1] : 0.0f;
+      meta.beams[b].fd_ctr = m.fd_ctr;
+      PerfLogger::add("RangeCompress_And_FdEst", t_stage.stop_ms(), algoGroup);
+    } else {
+      // CPU path: rc已有效，直接估计
+      std::vector<double> fd_res = estimateFdCenter(rc, Wloc, Mloc, P2.PRF, speed, raw.fw_angle_deg, lambda, 1);
+      m.fd_ctr = (fd_res.size() > 1) ? (float)fd_res[1] : 0.0f;
+      meta.beams[b].fd_ctr = m.fd_ctr;
+      PerfLogger::add("FdCtrEstimate", t_stage.stop_ms(), algoGroup);
+    }
+
+    if (!P2.isPC)
+    {
+      t_stage.start();
+      // GPU pipeline: async copy input to device, run device buffers pipeline,
+      // then copy minimal result back (az spec) for host-side slicing.
+      const int Lraw = raw.Lraw;
+      const int Wloc = raw.W;
+      const int Mloc = P2.range_samp_used;
+
+      // prepare host input contiguous buffer (std::complex<double>) of size Wloc*Lraw
+      std::vector<std::complex<double>> h_inData((size_t)Wloc * Lraw);
+      for (int i = 0; i < Wloc * Lraw; ++i)
+        h_inData[i] = raw.s[i];
+
+      size_t this_in_bytes = (size_t)Wloc * Lraw * sizeof(std::complex<double>);
+      size_t this_rc_bytes = (size_t)Wloc * Mloc * sizeof(std::complex<double>);
+
+      // async copy host -> device input
+      if (cudaMemcpyAsync(d_inDouble, h_inData.data(), this_in_bytes, cudaMemcpyHostToDevice, stream) != cudaSuccess) {
+        std::fprintf(stderr, "[ERR] cudaMemcpyAsync input failed on beam %d\n", b);
+        return false;
+      }
+    
+      // choose device HfSpec pointer
+      void *d_HfPtr = d_HfSpec;
+
+      // run range compression on device (results in d_rcDouble)
+      if (!rangeCompressCuFFT_device_buffers(P2, d_inDouble, d_HfPtr, d_rcDouble, Wloc, Lraw, Mloc, stream)) {
+        std::fprintf(stderr, "[ERR] rangeCompressCuFFT_device_buffers failed on beam %d\n", b);
+        return false;
+      }
+      // copy back the range-compressed data to host for fd estimation
+      rc.resize((size_t)Wloc * Mloc);
+      size_t this_rc_bytes_host = (size_t)Wloc * Mloc * sizeof(std::complex<double>);
+      if (cudaMemcpyAsync(rc.data(), d_rcDouble, this_rc_bytes_host, cudaMemcpyDeviceToHost, stream) != cudaSuccess) {
+        std::fprintf(stderr, "[ERR] cudaMemcpyAsync rc copy failed on beam %d\n", b);
+        return false;
+      }
+
+      // wait for range compress to finish so host can compute fd estimate
+      if (cudaStreamSynchronize(stream) != cudaSuccess) {
+        std::fprintf(stderr, "[ERR] cudaStreamSynchronize failed on beam %d\n", b);
+        return false;
+      }
+
+      PerfLogger::add("RangeCompress", t_stage.stop_ms(), algoGroup);
+    }
+    else
+    {
+      const int Lraw = raw.Lraw;
+      const int Lraw2M = Lraw / M;
+      rc.resize((size_t)W * M);
+      for (int k = 0; k < W; ++k)
+      {
+        for (int m = 0; m < M; ++m)
+        {
+          rc[(size_t)k * M + m] = raw.s[(size_t)k * Lraw + m * Lraw2M];
+        }
+      }
+    }
 
     // (d) 方位 FFT + 频率重心移零
-    Image2D<std::complex<float>> rcImg(W, M);
-    if (static_cast<int>(rc.size()) != W * M)
-    {
-      std::fprintf(stderr, "[ERR] rc size mismatch on beam %d\n", b);
-      return false;
-    }
-    for (int r = 0; r < W; ++r)
-      for (int c = 0; c < M; ++c)
-        rcImg.at(r, c) = static_cast<std::complex<float>>(rc[static_cast<size_t>(r) * M + c]);
-
+    t_stage.start();
     Image2D<std::complex<float>> azSpec;
-    if (!azFftShiftAndRecenterCuFFT(rcImg, static_cast<float>(P2.PRF), m.fd_ctr, azSpec))
-    {
-      std::fprintf(stderr, "[ERR] azFftShiftAndRecenterCuFFT failed on beam %d\n", b);
-      return false;
+    if (!P2.isPC) {
+      // GPU path: run az FFT on device using preallocated buffers, then copy az-spectrum back
+      size_t nelem = (size_t)Wloc * Mloc;
+      if (static_cast<int>(rc.size()) != Wloc * Mloc) {
+        std::fprintf(stderr, "[ERR] rc size mismatch on beam %d (gpu)\n", b);
+        return false;
+      }
+
+      if (!convertDoubleToFloatDevice(d_rcDouble, d_rcFloat, nelem, stream)) {
+        std::fprintf(stderr, "[ERR] convertDoubleToFloatDevice failed on beam %d\n", b);
+        return false;
+      }
+
+      if (!azFftShiftAndRecenterCuFFT_device(d_rcFloat, Wloc, Mloc, static_cast<float>(P2.PRF), m.fd_ctr, d_azFloat, stream)) {
+        std::fprintf(stderr, "[ERR] azFftShiftAndRecenterCuFFT_device failed on beam %d\n", b);
+        return false;
+      }
+
+      std::vector<std::complex<float>> h_az(nelem);
+      size_t this_az_bytes = nelem * sizeof(std::complex<float>);
+      if (cudaMemcpyAsync(h_az.data(), d_azFloat, this_az_bytes, cudaMemcpyDeviceToHost, stream) != cudaSuccess) {
+        std::fprintf(stderr, "[ERR] cudaMemcpyAsync az copy failed on beam %d\n", b);
+        return false;
+      }
+      if (cudaStreamSynchronize(stream) != cudaSuccess) {
+        std::fprintf(stderr, "[ERR] cudaStreamSynchronize failed on beam %d\n", b);
+        return false;
+      }
+
+      azSpec = Image2D<std::complex<float>>(Wloc, Mloc);
+      for (int r = 0; r < Wloc; ++r)
+        for (int c = 0; c < Mloc; ++c)
+          azSpec.at(r, c) = static_cast<std::complex<float>>(h_az[(size_t)r * Mloc + c]);
     }
+    else {
+      // CPU path: build rcImg and run host-side az FFT
+      Image2D<std::complex<float>> rcImg(Wloc, Mloc);
+      if (static_cast<int>(rc.size()) != Wloc * Mloc)
+      {
+        std::fprintf(stderr, "[ERR] rc size mismatch on beam %d (cpu)\n", b);
+        return false;
+      }
+      for (int r = 0; r < Wloc; ++r)
+        for (int c = 0; c < Mloc; ++c)
+          rcImg.at(r, c) = static_cast<std::complex<float>>(rc[static_cast<size_t>(r) * Mloc + c]);
+
+      if (!azFftShiftAndRecenterCuFFT(rcImg, static_cast<float>(P2.PRF), m.fd_ctr, azSpec))
+      {
+        std::fprintf(stderr, "[ERR] azFftShiftAndRecenterCuFFT failed on beam %d\n", b);
+        return false;
+      }
+    }
+    PerfLogger::add("Az FFT", t_stage.stop_ms(), algoGroup);
 
     // (f) 裁剪有效方位通道
+    t_stage.start();
     Image2D<float> amp_eff;
     std::vector<float> fd_axis_eff;
     if (!sliceEffectiveAzBins(azSpec, 0.0f, RD.nEff, static_cast<float>(P2.PRF),
@@ -419,6 +727,7 @@ bool DbsStitcher::processAllBeamsGPU(Params &P,
       std::fprintf(stderr, "[ERR] sliceEffectiveAzBins failed on beam %d\n", b);
       return false;
     }
+    PerfLogger::add("AzimuthSlice_Amp", t_stage.stop_ms(), algoGroup);
 
     // 写回 RD / meta
     RD.amp[b] = amp_eff;
@@ -427,6 +736,7 @@ bool DbsStitcher::processAllBeamsGPU(Params &P,
     meta.beams[b] = m;
   }
 
+  // PerfLogger::add("GPU2_ALL_BEAMS_DONE", t_total.stop_ms(), algoGroup);
   return true;
 }
 
